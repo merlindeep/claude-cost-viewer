@@ -1,0 +1,96 @@
+# GoReleaser configuration (schema v2).
+# Docs: https://goreleaser.com
+#
+# Local dry run:   goreleaser release --snapshot --clean
+# Validate config: goreleaser check
+#
+# A tagged release (vX.Y.Z) on GitHub triggers .github/workflows/release.yml,
+# which runs `goreleaser release` to publish binaries, checksums, and an updated
+# Homebrew formula in the tap repository.
+version: 2
+
+project_name: ccview
+
+before:
+  hooks:
+    - go test ./...
+
+builds:
+  - id: ccview
+    main: ./cmd/ccview
+    binary: ccview
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X github.com/merlindeep/claude-cost-viewer/internal/buildinfo.Version={{ .Version }}
+      - -X github.com/merlindeep/claude-cost-viewer/internal/buildinfo.Commit={{ .ShortCommit }}
+      - -X github.com/merlindeep/claude-cost-viewer/internal/buildinfo.Date={{ .Date }}
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - id: default
+    # Default archive format is tar.gz on Unix, which is what we ship.
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    files:
+      - README.md
+      - LICENSE
+      - CHANGELOG.md
+
+checksum:
+  name_template: checksums.txt
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  use: github
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "^ci:"
+      - "Merge pull request"
+
+# Homebrew formula.
+#
+# NOT PUBLISHED YET: `skip_upload: true` makes GoReleaser generate the formula
+# as a build artifact (under dist/) for review, but does NOT push it to the tap
+# repository. To start publishing later:
+#   1. Create the tap repo:  github.com/merlindeep/homebrew-tap
+#   2. Provide a token with write access to it as HOMEBREW_TAP_GITHUB_TOKEN
+#      (uncomment the `token:` line below).
+#   3. Set `skip_upload: false` (or remove the line).
+# Users will then be able to: brew install merlindeep/tap/ccview
+brews:
+  - name: ccview
+    skip_upload: true
+    repository:
+      owner: merlindeep
+      name: homebrew-tap
+      # token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    directory: Formula
+    homepage: "https://github.com/merlindeep/claude-cost-viewer"
+    description: "Compact console monitor for Claude usage limits"
+    license: "0BSD"
+    commit_author:
+      name: goreleaser-bot
+      email: goreleaser@users.noreply.github.com
+    install: |
+      bin.install "ccview"
+    test: |
+      system "#{bin}/ccview", "version"
+
+release:
+  draft: false
+  prerelease: auto

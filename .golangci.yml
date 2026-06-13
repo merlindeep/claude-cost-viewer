@@ -1,0 +1,33 @@
+# golangci-lint configuration (schema v2).
+# Docs: https://golangci-lint.run
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: standard # errcheck, govet, ineffassign, staticcheck, unused
+  enable:
+    - bodyclose
+    - misspell
+    - revive
+    - unconvert
+  settings:
+    errcheck:
+      # Writes to stdout/stderr for human output: an error here is not
+      # actionable, so we do not require checking it.
+      exclude-functions:
+        - fmt.Fprint
+        - fmt.Fprintf
+        - fmt.Fprintln
+  exclusions:
+    rules:
+      # Tests may ignore some return values for brevity.
+      - path: _test\.go
+        linters:
+          - errcheck
+
+formatters:
+  enable:
+    - gofmt
+    - goimports

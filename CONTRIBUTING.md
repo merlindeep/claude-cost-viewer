@@ -5,7 +5,7 @@ build, test, and submit changes.
 
 ## Prerequisites
 
-- Go 1.23 or newer.
+- Go 1.24 or newer.
 - (Optional) [golangci-lint](https://golangci-lint.run) v2 for linting.
 - (Optional) [GoReleaser](https://goreleaser.com) v2 for release builds.
 

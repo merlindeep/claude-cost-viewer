@@ -86,7 +86,7 @@ If you have run Claude Code at least once, the token is already in place.
 > The first tagged release is required for pre-built binaries and Homebrew.
 > Until then, install from source with the Go toolchain.
 
-### With `go install` (Go 1.23+)
+### With `go install` (Go 1.24+)
 
 ```sh
 go install github.com/merlindeep/claude-cost-viewer/cmd/ccview@latest

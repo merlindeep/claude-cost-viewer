@@ -23,8 +23,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/mattn/go-isatty"
 	"github.com/spf13/cobra"
-	"golang.org/x/term"
 
 	"github.com/merlindeep/claude-cost-viewer/internal/auth"
 	"github.com/merlindeep/claude-cost-viewer/internal/buildinfo"
@@ -206,7 +206,7 @@ func wantColor(out io.Writer, noColor bool) bool {
 // isTerminal reports whether w is an *os.File attached to a terminal.
 func isTerminal(w io.Writer) bool {
 	if f, ok := w.(*os.File); ok {
-		return term.IsTerminal(int(f.Fd()))
+		return isatty.IsTerminal(f.Fd())
 	}
 	return false
 }

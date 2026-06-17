@@ -60,6 +60,65 @@ func (f *fakeFetcher) Fetch(_ context.Context, _ string) (*usage.Usage, []byte, 
 	return f.u, f.raw, f.err
 }
 
+// scriptResolver returns a sequence of credentials on successive Resolve calls,
+// repeating the last entry once the script is exhausted. It models Claude Code
+// refreshing the stored token between resolutions. A non-nil entry in errs is
+// returned alongside the credentials at the same index.
+type scriptResolver struct {
+	creds []auth.Credentials
+	errs  []error
+	calls int
+}
+
+func (r *scriptResolver) Resolve() (auth.Credentials, error) {
+	i := r.calls
+	r.calls++
+	if i >= len(r.creds) {
+		i = len(r.creds) - 1
+	}
+	var err error
+	if i < len(r.errs) {
+		err = r.errs[i]
+	}
+	return r.creds[i], err
+}
+
+// tokenFetcher returns HTTP 401 for any token marked expired and a successful
+// snapshot otherwise, so tests can model a token that starts stale and is later
+// reloaded.
+type tokenFetcher struct {
+	u       *usage.Usage
+	expired map[string]bool
+	calls   int
+}
+
+func (f *tokenFetcher) Fetch(_ context.Context, token string) (*usage.Usage, []byte, error) {
+	f.calls++
+	if f.expired[token] {
+		return nil, nil, &client.APIError{Status: 401, Body: "expired"}
+	}
+	return f.u, []byte(`{"ok":true}`), nil
+}
+
+// statusTokenFetcher returns an APIError with the configured status for any
+// token marked bad, and a successful snapshot otherwise. It models a token the
+// endpoint rejects (for example a 429 for an expired token) that is later
+// reloaded to a working one.
+type statusTokenFetcher struct {
+	u      *usage.Usage
+	status int
+	bad    map[string]bool
+	calls  int
+}
+
+func (f *statusTokenFetcher) Fetch(_ context.Context, token string) (*usage.Usage, []byte, error) {
+	f.calls++
+	if f.bad[token] {
+		return nil, nil, &client.APIError{Status: f.status, Body: "rejected"}
+	}
+	return f.u, []byte(`{"ok":true}`), nil
+}
+
 func newTestDeps() (deps, *fakeResolver, *fakeFetcher, *bytes.Buffer, *bytes.Buffer) {
 	out := &bytes.Buffer{}
 	errb := &bytes.Buffer{}
@@ -72,6 +131,7 @@ func newTestDeps() (deps, *fakeResolver, *fakeFetcher, *bytes.Buffer, *bytes.Buf
 		Now:         func() time.Time { return refNow },
 		Sleep:       func(context.Context, time.Duration) bool { return true },
 		RunTUI:      func(context.Context, tui.Config) error { return nil },
+		Reload:      func(context.Context) error { return nil },
 		ClearScreen: false,
 		Out:         out,
 		Err:         errb,
@@ -147,6 +207,82 @@ func TestRunWatchUnauthorized(t *testing.T) {
 	}
 }
 
+// On a 401 the watcher re-resolves through the standard chain (where Claude Code
+// may have reloaded the token) and retries once, recovering silently.
+func TestRunWatchReauthSucceeds(t *testing.T) {
+	d, _, _, out, _ := newTestDeps()
+	d.Resolver = &scriptResolver{creds: []auth.Credentials{
+		{AccessToken: "stale-token"},
+		{AccessToken: "fresh-token", Plan: "max_20x"},
+	}}
+	fet := &tokenFetcher{u: sampleUsage(), expired: map[string]bool{"stale-token": true}}
+	d.NewFetcher = func(string) fetcher { return fet }
+
+	if err := runWatch(context.Background(), d, opts(render.ModeCompact, true)); err != nil {
+		t.Fatal(err)
+	}
+	if fet.calls != 2 {
+		t.Errorf("fetch calls = %d, want 2 (stale + retry)", fet.calls)
+	}
+	// The plan label proves the reloaded credentials were used downstream.
+	if !strings.Contains(out.String(), "Claude usage  Max 20x") {
+		t.Errorf("expected a successful render from the reloaded token:\n%s", out.String())
+	}
+	if strings.Contains(out.String(), "401") {
+		t.Errorf("a silent re-auth should not surface a 401:\n%s", out.String())
+	}
+}
+
+// When re-resolution returns the same (still-stale) token, the retry is skipped
+// and an informative message is printed.
+func TestRunWatchReauthSameTokenSkipsRetry(t *testing.T) {
+	d, _, fet, out, _ := newTestDeps()
+	fet.err = &client.APIError{Status: 401, Body: "expired"}
+	_ = runWatch(context.Background(), d, opts(render.ModeCompact, true))
+	if fet.calls != 1 {
+		t.Errorf("an unchanged token should not be retried, got %d calls", fet.calls)
+	}
+	if !strings.Contains(out.String(), "re-authentication failed") || !strings.Contains(out.String(), "try again") {
+		t.Errorf("expected an informative message:\n%s", out.String())
+	}
+}
+
+// A freshly resolved token that is also rejected falls through to the message.
+func TestRunWatchReauthFreshTokenStillUnauthorized(t *testing.T) {
+	d, _, _, out, _ := newTestDeps()
+	d.Resolver = &scriptResolver{creds: []auth.Credentials{
+		{AccessToken: "stale"}, {AccessToken: "also-bad"},
+	}}
+	fet := &tokenFetcher{u: sampleUsage(), expired: map[string]bool{"stale": true, "also-bad": true}}
+	d.NewFetcher = func(string) fetcher { return fet }
+	_ = runWatch(context.Background(), d, opts(render.ModeCompact, true))
+	if fet.calls != 2 {
+		t.Errorf("fetch calls = %d, want 2", fet.calls)
+	}
+	if !strings.Contains(out.String(), "re-authentication failed") {
+		t.Errorf("expected an informative message after a failed retry:\n%s", out.String())
+	}
+}
+
+// If re-resolution itself fails, the retry fetch is skipped and the original 401
+// is surfaced informatively.
+func TestRunWatchReauthResolveFails(t *testing.T) {
+	d, _, _, out, _ := newTestDeps()
+	d.Resolver = &scriptResolver{
+		creds: []auth.Credentials{{AccessToken: "stale"}, {}},
+		errs:  []error{nil, auth.ErrNotFound},
+	}
+	fet := &tokenFetcher{u: sampleUsage(), expired: map[string]bool{"stale": true}}
+	d.NewFetcher = func(string) fetcher { return fet }
+	_ = runWatch(context.Background(), d, opts(render.ModeCompact, true))
+	if fet.calls != 1 {
+		t.Errorf("a failed re-resolution should skip the retry fetch, got %d calls", fet.calls)
+	}
+	if !strings.Contains(out.String(), "re-authentication failed") {
+		t.Errorf("expected an informative message:\n%s", out.String())
+	}
+}
+
 func TestRunWatchRateLimited(t *testing.T) {
 	d, _, fet, out, _ := newTestDeps()
 	fet.err = &client.APIError{Status: 429, Body: "slow down"}
@@ -155,6 +291,173 @@ func TestRunWatchRateLimited(t *testing.T) {
 	_ = runWatch(context.Background(), d, opts(render.ModeCompact, false))
 	if !strings.Contains(out.String(), "Rate limited (HTTP 429)") {
 		t.Errorf("output:\n%s", out.String())
+	}
+}
+
+// An expired token is rejected by the endpoint with 429 (not 401). When
+// re-resolution yields the same still-expired token, the watcher reports it as
+// an expired-token problem rather than backing off as if rate limited.
+func TestRunWatchExpiredTokenSurfacedAsAuth(t *testing.T) {
+	d, res, fet, out, _ := newTestDeps()
+	res.creds.ExpiresAt = refNow.Add(-time.Minute).UnixMilli()
+	fet.err = &client.APIError{Status: 429, Body: "rate_limit_error"}
+	_ = runWatch(context.Background(), d, opts(render.ModeCompact, true))
+	if fet.calls != 1 {
+		t.Errorf("an unchanged expired token should not be retried, got %d calls", fet.calls)
+	}
+	if !strings.Contains(out.String(), "Token expired and re-authentication failed (HTTP 429)") {
+		t.Errorf("expected an expired-token notice:\n%s", out.String())
+	}
+	if strings.Contains(out.String(), "Rate limited") {
+		t.Errorf("an expired token must not be reported as rate limiting:\n%s", out.String())
+	}
+}
+
+// On a 429 caused by an expired token, the watcher re-resolves (where Claude
+// Code may have reloaded the token in the background) and retries once,
+// recovering silently.
+func TestRunWatchExpiredTokenRefreshSucceeds(t *testing.T) {
+	d, _, _, out, _ := newTestDeps()
+	d.Resolver = &scriptResolver{creds: []auth.Credentials{
+		{AccessToken: "stale-token", ExpiresAt: refNow.Add(-time.Minute).UnixMilli()},
+		{AccessToken: "fresh-token", Plan: "max_20x"},
+	}}
+	fet := &statusTokenFetcher{u: sampleUsage(), status: 429, bad: map[string]bool{"stale-token": true}}
+	d.NewFetcher = func(string) fetcher { return fet }
+
+	if err := runWatch(context.Background(), d, opts(render.ModeCompact, true)); err != nil {
+		t.Fatal(err)
+	}
+	if fet.calls != 2 {
+		t.Errorf("fetch calls = %d, want 2 (stale 429 + retry)", fet.calls)
+	}
+	if !strings.Contains(out.String(), "Claude usage  Max 20x") {
+		t.Errorf("expected a successful render from the reloaded token:\n%s", out.String())
+	}
+	if strings.Contains(out.String(), "429") || strings.Contains(out.String(), "Rate limited") {
+		t.Errorf("a silent recovery should not surface a 429:\n%s", out.String())
+	}
+}
+
+// If the reloaded token is valid (not expired) but the endpoint still returns
+// 429, that is genuine rate limiting and is reported as such.
+func TestRunWatchExpiredTokenRefreshStillRateLimited(t *testing.T) {
+	d, _, _, out, _ := newTestDeps()
+	d.Resolver = &scriptResolver{creds: []auth.Credentials{
+		{AccessToken: "stale-token", ExpiresAt: refNow.Add(-time.Minute).UnixMilli()},
+		{AccessToken: "fresh-token"},
+	}}
+	fet := &statusTokenFetcher{u: sampleUsage(), status: 429, bad: map[string]bool{"stale-token": true, "fresh-token": true}}
+	d.NewFetcher = func(string) fetcher { return fet }
+	_ = runWatch(context.Background(), d, opts(render.ModeCompact, true))
+	if fet.calls != 2 {
+		t.Errorf("fetch calls = %d, want 2", fet.calls)
+	}
+	if !strings.Contains(out.String(), "Rate limited (HTTP 429)") {
+		t.Errorf("a non-expired token that is still 429 is genuine rate limiting:\n%s", out.String())
+	}
+}
+
+// A 429 while the token is still valid (a future expiry) is genuine rate
+// limiting: the watcher backs off and does not attempt a re-auth retry.
+func TestRunWatchRateLimitedTokenStillValid(t *testing.T) {
+	d, res, fet, out, _ := newTestDeps()
+	res.creds.ExpiresAt = refNow.Add(30 * time.Minute).UnixMilli()
+	fet.err = &client.APIError{Status: 429, Body: "slow down"}
+	_ = runWatch(context.Background(), d, opts(render.ModeCompact, true))
+	if fet.calls != 1 {
+		t.Errorf("a valid token must not trigger a re-auth retry, got %d calls", fet.calls)
+	}
+	if !strings.Contains(out.String(), "Rate limited (HTTP 429)") {
+		t.Errorf("output:\n%s", out.String())
+	}
+}
+
+// --- auto-reload -----------------------------------------------------------
+
+// With --auto-reload-expired-token, an expired token triggers a single Claude Code refresh;
+// the freshly resolved token then succeeds and the loop recovers silently.
+func TestRunWatchAutoReloadTokenRecovers(t *testing.T) {
+	d, _, _, out, _ := newTestDeps()
+	d.Resolver = &scriptResolver{creds: []auth.Credentials{
+		{AccessToken: "stale", ExpiresAt: refNow.Add(-time.Minute).UnixMilli()},
+		{AccessToken: "fresh", Plan: "max_20x"},
+	}}
+	fet := &statusTokenFetcher{u: sampleUsage(), status: 429, bad: map[string]bool{"stale": true}}
+	d.NewFetcher = func(string) fetcher { return fet }
+	reloads := 0
+	d.Reload = func(context.Context) error { reloads++; return nil }
+
+	o := opts(render.ModeCompact, true)
+	o.AutoReloadToken = true
+	if err := runWatch(context.Background(), d, o); err != nil {
+		t.Fatal(err)
+	}
+	if reloads != 1 {
+		t.Errorf("reload attempts = %d, want 1", reloads)
+	}
+	if !strings.Contains(out.String(), "running Claude Code once to reload") {
+		t.Errorf("expected a refresh notice:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "Claude usage  Max 20x") {
+		t.Errorf("expected a successful render after refresh:\n%s", out.String())
+	}
+}
+
+// With --auto-reload-expired-token, if the refresh does not yield a working token, the watch
+// still reports the expiry (and, thanks to the cooldown, will not retry yet).
+func TestRunWatchAutoReloadTokenStillExpired(t *testing.T) {
+	d, res, fet, out, _ := newTestDeps()
+	res.creds.ExpiresAt = refNow.Add(-time.Minute).UnixMilli()
+	fet.err = &client.APIError{Status: 429, Body: "rate_limit_error"}
+	reloads := 0
+	d.Reload = func(context.Context) error { reloads++; return errors.New("claude failed") }
+
+	o := opts(render.ModeCompact, true)
+	o.AutoReloadToken = true
+	_ = runWatch(context.Background(), d, o)
+	if reloads != 1 {
+		t.Errorf("reload attempts = %d, want 1", reloads)
+	}
+	if !strings.Contains(out.String(), "Token expired and re-authentication failed (HTTP 429)") {
+		t.Errorf("expected the expired-token notice after a failed refresh:\n%s", out.String())
+	}
+}
+
+// The 5-minute cooldown means a tight poll loop reloads at most once (the
+// injected clock is fixed, so later iterations fall inside the window).
+func TestRunWatchAutoReloadTokenCooldown(t *testing.T) {
+	d, res, fet, _, _ := newTestDeps()
+	res.creds.ExpiresAt = refNow.Add(-time.Minute).UnixMilli()
+	fet.err = &client.APIError{Status: 429}
+	reloads := 0
+	d.Reload = func(context.Context) error { reloads++; return nil }
+	d.Sleep = sleepNTimes(2) // three iterations
+
+	o := opts(render.ModeCompact, false)
+	o.AutoReloadToken = true
+	_ = runWatch(context.Background(), d, o)
+	if reloads != 1 {
+		t.Errorf("the cooldown should permit a single refresh, got %d", reloads)
+	}
+}
+
+func TestReloadCmdline(t *testing.T) {
+	if got := reloadCmdline(func(string) string { return "" }); got != defaultReloadCmd {
+		t.Errorf("empty env should use the default, got %q", got)
+	}
+	if got := reloadCmdline(func(string) string { return "  my-cmd --x  " }); got != "my-cmd --x" {
+		t.Errorf("override = %q", got)
+	}
+}
+
+func TestRunReload(t *testing.T) {
+	// Harmless overrides keep the test off the network and away from claude.
+	if err := runReload(context.Background(), func(string) string { return "exit 0" }); err != nil {
+		t.Errorf("a zero-exit refresh command should succeed: %v", err)
+	}
+	if err := runReload(context.Background(), func(string) string { return "exit 3" }); err == nil {
+		t.Error("a non-zero refresh command should report an error")
 	}
 }
 
@@ -285,7 +588,7 @@ func TestDefaultDeps(t *testing.T) {
 	out := &bytes.Buffer{}
 	errb := &bytes.Buffer{}
 	d := defaultDeps(out, errb)
-	if d.Resolver == nil || d.NewFetcher == nil || d.Version == nil || d.RunTUI == nil {
+	if d.Resolver == nil || d.NewFetcher == nil || d.Version == nil || d.RunTUI == nil || d.Reload == nil {
 		t.Fatal("defaultDeps left a dependency unset")
 	}
 	// Exercise the closures so they are covered and wired correctly.
@@ -304,6 +607,11 @@ func TestDefaultDeps(t *testing.T) {
 	cancel()
 	if d.Sleep(ctx, 0) {
 		t.Error("Sleep with cancelled context should return false")
+	}
+	// Exercise Reload with a harmless override so it never spawns claude.
+	t.Setenv("CCVIEW_RELOAD_CMD", "exit 0")
+	if err := d.Reload(context.Background()); err != nil {
+		t.Errorf("Reload with a harmless override should succeed: %v", err)
 	}
 }
 
@@ -427,6 +735,86 @@ func TestRunTUIMockFetch(t *testing.T) {
 	}
 }
 
+// A 401 surfaced to the TUI is translated into a friendly, actionable message
+// rather than the raw "HTTP 401" error.
+func TestRunTUIReauthMessage(t *testing.T) {
+	d, _, fet, _, _ := newTestDeps()
+	fet.err = &client.APIError{Status: 401}
+	var captured tui.Config
+	d.RunTUI = func(_ context.Context, cfg tui.Config) error { captured = cfg; return nil }
+	if err := runTUI(context.Background(), d, runOptions{Interval: time.Minute}); err != nil {
+		t.Fatal(err)
+	}
+	r := captured.Fetch()
+	if r.Err == nil || !strings.Contains(r.Err.Error(), "try again") {
+		t.Errorf("expected a friendly re-auth error, got %v", r.Err)
+	}
+}
+
+// A 429 caused by an expired token is translated by the TUI into the same
+// friendly re-auth message as a 401.
+func TestRunTUIExpiredTokenMessage(t *testing.T) {
+	d, res, fet, _, _ := newTestDeps()
+	res.creds.ExpiresAt = refNow.Add(-time.Minute).UnixMilli()
+	fet.err = &client.APIError{Status: 429}
+	var captured tui.Config
+	d.RunTUI = func(_ context.Context, cfg tui.Config) error { captured = cfg; return nil }
+	if err := runTUI(context.Background(), d, runOptions{Interval: time.Minute}); err != nil {
+		t.Fatal(err)
+	}
+	r := captured.Fetch()
+	if r.Err == nil || !strings.Contains(r.Err.Error(), "try again") {
+		t.Errorf("expected a friendly re-auth error for an expired-token 429, got %v", r.Err)
+	}
+}
+
+// With --auto-reload-expired-token, the TUI fetch reloads an expired token via
+// Claude Code and then succeeds with the refreshed credentials.
+func TestRunTUIAutoReloadRecovers(t *testing.T) {
+	d, _, _, _, _ := newTestDeps()
+	d.Resolver = &scriptResolver{creds: []auth.Credentials{
+		{AccessToken: "stale", ExpiresAt: refNow.Add(-time.Minute).UnixMilli()},
+		{AccessToken: "fresh", Plan: "max_20x"},
+	}}
+	fet := &statusTokenFetcher{u: sampleUsage(), status: 429, bad: map[string]bool{"stale": true}}
+	d.NewFetcher = func(string) fetcher { return fet }
+	reloads := 0
+	d.Reload = func(context.Context) error { reloads++; return nil }
+	var captured tui.Config
+	d.RunTUI = func(_ context.Context, cfg tui.Config) error { captured = cfg; return nil }
+
+	if err := runTUI(context.Background(), d, runOptions{Interval: time.Minute, AutoReloadToken: true}); err != nil {
+		t.Fatal(err)
+	}
+	r := captured.Fetch()
+	if reloads != 1 {
+		t.Errorf("reload attempts = %d, want 1", reloads)
+	}
+	if r.Err != nil || r.Plan != "Max 20x" {
+		t.Errorf("expected a successful fetch after reload, got %+v", r)
+	}
+}
+
+// The 5-minute cooldown applies in the TUI too: repeated fetches reload once.
+func TestRunTUIAutoReloadCooldown(t *testing.T) {
+	d, res, fet, _, _ := newTestDeps()
+	res.creds.ExpiresAt = refNow.Add(-time.Minute).UnixMilli()
+	fet.err = &client.APIError{Status: 429}
+	reloads := 0
+	d.Reload = func(context.Context) error { reloads++; return nil }
+	var captured tui.Config
+	d.RunTUI = func(_ context.Context, cfg tui.Config) error { captured = cfg; return nil }
+
+	if err := runTUI(context.Background(), d, runOptions{Interval: time.Minute, AutoReloadToken: true}); err != nil {
+		t.Fatal(err)
+	}
+	_ = captured.Fetch()
+	_ = captured.Fetch()
+	if reloads != 1 {
+		t.Errorf("the cooldown should permit a single reload across fetches, got %d", reloads)
+	}
+}
+
 func TestRunTUIPropagatesError(t *testing.T) {
 	d, _, _, _, _ := newTestDeps()
 	d.RunTUI = func(context.Context, tui.Config) error { return errors.New("tui failed") }
@@ -478,6 +866,21 @@ func TestRootDebugFlag(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "ccview --debug") {
 		t.Errorf("output:\n%s", out.String())
+	}
+}
+
+// The --auto-reload-expired-token flag is wired through to runWatch, which triggers a single
+// refresh attempt for an expired token.
+func TestRootAutoReloadTokenFlag(t *testing.T) {
+	d, res, _, _, _ := newTestDeps()
+	res.creds.ExpiresAt = refNow.Add(-time.Minute).UnixMilli()
+	reloaded := false
+	d.Reload = func(context.Context) error { reloaded = true; return nil }
+	if err := execRoot(d, "--auto-reload-expired-token", "--once"); err != nil {
+		t.Fatal(err)
+	}
+	if !reloaded {
+		t.Error("--auto-reload-expired-token should trigger a refresh for an expired token")
 	}
 }
 

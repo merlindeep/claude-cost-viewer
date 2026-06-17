@@ -81,6 +81,7 @@ func defaultDeps(out, errW io.Writer) deps {
 		Now:         time.Now,
 		Sleep:       sleepCtx,
 		RunTUI:      tui.Run,
+		Reload:      func(ctx context.Context) error { return runReload(ctx, os.Getenv) },
 		ClearScreen: isTerminal(out),
 		Out:         out,
 		Err:         errW,
@@ -93,13 +94,14 @@ func defaultDeps(out, errW io.Writer) deps {
 // newRootCmd constructs the root command bound to the given dependencies.
 func newRootCmd(d deps) *cobra.Command {
 	var (
-		interval time.Duration
-		once     bool
-		debug    bool
-		noColor  bool
-		showAll  bool
-		asJSON   bool
-		modeStr  string
+		interval        time.Duration
+		once            bool
+		debug           bool
+		noColor         bool
+		showAll         bool
+		asJSON          bool
+		modeStr         string
+		autoReloadToken bool
 	)
 
 	root := &cobra.Command{
@@ -123,10 +125,11 @@ func newRootCmd(d deps) *cobra.Command {
 
 			color := wantColor(d.Out, noColor)
 			o := runOptions{
-				Interval:       effInterval,
-				Once:           once,
-				Color:          color,
-				ShowZeroModels: showAll,
+				Interval:        effInterval,
+				Once:            once,
+				Color:           color,
+				ShowZeroModels:  showAll,
+				AutoReloadToken: autoReloadToken,
 			}
 
 			// The TUI is selected via mode but does not go through the render
@@ -162,6 +165,9 @@ func newRootCmd(d deps) *cobra.Command {
 	flags.BoolVar(&asJSON, "json", false, "shortcut for --mode json")
 	flags.BoolVar(&noColor, "no-color", false, "disable ANSI colours (also honours the NO_COLOR environment variable)")
 	flags.BoolVarP(&showAll, "all", "a", false, "show per-model windows even when at 0%")
+	flags.BoolVar(&autoReloadToken, "auto-reload-expired-token", false,
+		"if the stored token has expired, run Claude Code once to reload it "+
+			"(uses a little quota; at most once per 5m; override with CCVIEW_RELOAD_CMD)")
 
 	root.SetVersionTemplate("ccview {{.Version}}\n")
 	root.AddCommand(newVersionCmd(d))

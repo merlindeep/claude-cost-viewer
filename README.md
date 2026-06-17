@@ -82,6 +82,22 @@ priority order:
 
 If you have run Claude Code at least once, the token is already in place.
 
+If a token expires mid-session, `ccview` does not stop or print a raw error: it
+re-reads the chain above — picking up the token Claude Code refreshes in the
+background — and retries once. Only if that still fails does it print a short,
+actionable message asking you to refresh the token and try again.
+
+By default `ccview` never refreshes the token itself; it relies on Claude Code
+to do so. If you would rather it nudge Claude Code automatically, pass
+`--auto-reload-expired-token`: when the stored token has expired, `ccview` runs
+Claude Code once (`claude -p --model haiku …` by default) to renew it, then
+re-reads the refreshed token and continues. This spends a little quota, so it is
+opt-in and limited to **at most one attempt every five minutes**, and it works
+in every watch mode, including the TUI. Override the command it runs with
+`CCVIEW_RELOAD_CMD` (for example, a script that performs a quota-free refresh).
+`ccview` still never reads or writes the token itself — it only invokes the
+helper and re-reads the credential chain above.
+
 ## Requirements
 
 `ccview` needs an OAuth token issued to **Claude Code (the CLI)**. The simplest
@@ -153,17 +169,18 @@ the default, familiar view. Press `Ctrl+C` to quit.
 
 ### Flags
 
-| Flag                 | Default   | Description                                                    |
-| -------------------- | --------- | -------------------------------------------------------------- |
-| `-i`, `--interval`   | `1m`      | Refresh interval as a Go duration (`30s`, `1m`, `2m`).         |
-| `--once`             | `false`   | Fetch a single snapshot and exit.                              |
-| `-m`, `--mode`       | `compact` | Output mode: `compact`, `table`, `json`, `oneline`, `tui`.     |
-| `--json`             | `false`   | Shortcut for `--mode json`.                                    |
-| `-a`, `--all`        | `false`   | Show per-model windows even when at 0%.                        |
-| `-d`, `--debug`      | `false`   | Print diagnostics (token source, HTTP status, raw response).   |
-| `--no-color`         | `false`   | Disable ANSI colour (also honours the `NO_COLOR` env var).     |
-| `-h`, `--help`       |           | Help for any command.                                          |
-| `-v`, `--version`    |           | Print the version.                                             |
+| Flag                          | Default   | Description                                                  |
+| ----------------------------- | --------- | ------------------------------------------------------------ |
+| `-i`, `--interval`            | `1m`      | Refresh interval as a Go duration (`30s`, `1m`, `2m`).       |
+| `--once`                      | `false`   | Fetch a single snapshot and exit.                            |
+| `-m`, `--mode`                | `compact` | Output mode: `compact`, `table`, `json`, `oneline`, `tui`.   |
+| `--json`                      | `false`   | Shortcut for `--mode json`.                                  |
+| `-a`, `--all`                 | `false`   | Show per-model windows even when at 0%.                      |
+| `--auto-reload-expired-token` | `false`   | Opt-in: renew an expired token by invoking Claude Code.      |
+| `-d`, `--debug`               | `false`   | Print diagnostics (token source, HTTP status, raw response). |
+| `--no-color`                  | `false`   | Disable ANSI colour (also honours the `NO_COLOR` env var).   |
+| `-h`, `--help`                |           | Help for any command.                                        |
+| `-v`, `--version`             |           | Print the version.                                           |
 
 ### Commands
 
@@ -236,13 +253,14 @@ Claude 5h:42% 7d:13% opus:90% extra:16%
 
 Environment variables:
 
-| Variable                  | Purpose                                                                 |
-| ------------------------- | ----------------------------------------------------------------------- |
-| `CLAUDE_CODE_OAUTH_TOKEN` | Provide the OAuth token directly (highest priority).                    |
-| `CLAUDE_CODE_VERSION`     | Override the version used in the `User-Agent` header.                   |
-| `NO_COLOR`                | If set, disables ANSI colour (in addition to `--no-color`).             |
-| `CCVIEW_MOCK_FILE`        | Render a usage payload from a JSON file instead of calling the API.     |
-| `CCVIEW_MOCK_PLAN`        | Plan label used together with `CCVIEW_MOCK_FILE`.                       |
+| Variable                  | Purpose                                                             |
+| ------------------------- | ------------------------------------------------------------------- |
+| `CLAUDE_CODE_OAUTH_TOKEN` | Provide the OAuth token directly (highest priority).                |
+| `CLAUDE_CODE_VERSION`     | Override the version used in the `User-Agent` header.               |
+| `NO_COLOR`                | If set, disables ANSI colour (in addition to `--no-color`).         |
+| `CCVIEW_MOCK_FILE`        | Render a usage payload from a JSON file instead of calling the API. |
+| `CCVIEW_MOCK_PLAN`        | Plan label used together with `CCVIEW_MOCK_FILE`.                   |
+| `CCVIEW_RELOAD_CMD`       | Command used by `--auto-reload-expired-token` to renew the token.   |
 
 If `CLAUDE_CODE_VERSION` is not set, `ccview` runs `claude --version` to detect
 the installed Claude Code version, falling back to a built-in default.

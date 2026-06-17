@@ -5,6 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os/exec"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/merlindeep/claude-cost-viewer/internal/auth"
@@ -56,6 +59,7 @@ type deps struct {
 	Now         func() time.Time
 	Sleep       func(ctx context.Context, d time.Duration) bool
 	RunTUI      func(ctx context.Context, cfg tui.Config) error
+	Reload      func(ctx context.Context) error
 	ClearScreen bool
 	Out         io.Writer
 	Err         io.Writer
@@ -66,11 +70,12 @@ type deps struct {
 
 // runOptions are the resolved, validated options for a single invocation.
 type runOptions struct {
-	Interval       time.Duration
-	Once           bool
-	Mode           render.Mode
-	Color          bool
-	ShowZeroModels bool
+	Interval        time.Duration
+	Once            bool
+	Mode            render.Mode
+	Color           bool
+	ShowZeroModels  bool
+	AutoReloadToken bool
 }
 
 func (o runOptions) renderOptions(now time.Time, plan string) render.Options {
@@ -88,12 +93,106 @@ func (o runOptions) isHumanDashboard() bool {
 	return o.Mode == render.ModeCompact || o.Mode == render.ModeTable
 }
 
+// isUnauthorized reports whether err is an HTTP 401 from the usage endpoint,
+// i.e. the OAuth token was rejected because it has expired or been revoked.
+func isUnauthorized(err error) bool {
+	var apiErr *client.APIError
+	return errors.As(err, &apiErr) && apiErr.Status == 401
+}
+
+// isRateLimited reports whether err is an HTTP 429 from the usage endpoint. The
+// endpoint returns 429 both for genuine rate limiting and to reject a token it
+// dislikes — notably an expired token or a foreign User-Agent.
+func isRateLimited(err error) bool {
+	var apiErr *client.APIError
+	return errors.As(err, &apiErr) && apiErr.Status == 429
+}
+
+// credsExpired reports whether creds carry a known expiry that is at or before
+// now. Credentials without expiry information are treated as not expired.
+func credsExpired(creds auth.Credentials, now time.Time) bool {
+	exp, ok := creds.ExpiresAtTime()
+	return ok && !exp.After(now)
+}
+
+// shouldReauth reports whether err warrants re-resolving credentials and
+// retrying the request once. The endpoint rejects a stale token in one of two
+// ways: an explicit HTTP 401, or — for an already-expired token — an HTTP 429
+// that is otherwise indistinguishable from real rate limiting. In both cases
+// Claude Code may have refreshed the stored token in the background, so a single
+// re-resolve is worth attempting.
+func shouldReauth(err error, creds auth.Credentials, now time.Time) bool {
+	return isUnauthorized(err) || (isRateLimited(err) && credsExpired(creds, now))
+}
+
+// fetchWithRetry fetches a usage snapshot for creds. If the endpoint rejects the
+// token — with HTTP 401, or with HTTP 429 while the token has already expired —
+// it re-resolves credentials through the standard chain (in case Claude Code
+// refreshed the token in the background) and retries once with the fresh token.
+// The retry is skipped when re-resolution fails or yields the same token (which
+// would only earn another rejection).
+//
+// It returns the credentials actually used, so a successful refresh is reflected
+// upstream (for example in the plan label).
+func fetchWithRetry(ctx context.Context, d deps, f fetcher, creds auth.Credentials) (*usage.Usage, auth.Credentials, error) {
+	u, _, err := f.Fetch(ctx, creds.AccessToken)
+	if !shouldReauth(err, creds, d.Now()) {
+		return u, creds, err
+	}
+	fresh, rerr := d.Resolver.Resolve()
+	if rerr != nil || fresh.AccessToken == creds.AccessToken {
+		return u, creds, err
+	}
+	u, _, err = f.Fetch(ctx, fresh.AccessToken)
+	return u, fresh, err
+}
+
+// reloadGate serializes auto-reload attempts and enforces the cooldown between
+// them. It is safe for concurrent use: the TUI fetches from multiple goroutines.
+type reloadGate struct {
+	mu   sync.Mutex
+	last time.Time
+}
+
+// due reports whether a reload may be attempted at now, recording the attempt
+// time when it returns true. It returns false inside the cooldown window.
+func (g *reloadGate) due(now time.Time) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if now.Sub(g.last) < reloadCooldown {
+		return false
+	}
+	g.last = now
+	return true
+}
+
+// maybeReloadToken asks Claude Code to reload an expired token, at most once per
+// reloadCooldown, when --auto-reload-expired-token is set. It returns the
+// possibly-refreshed credentials. notify, when non-nil, is called just before a
+// reload attempt (the dashboard prints a status line; the TUI passes nil because
+// it owns the screen). ccview never reads or writes the token itself — it only
+// spawns the helper and re-resolves through the standard chain.
+func maybeReloadToken(ctx context.Context, d deps, o runOptions, g *reloadGate, creds auth.Credentials, now time.Time, notify func()) auth.Credentials {
+	if !o.AutoReloadToken || !credsExpired(creds, now) || !g.due(now) {
+		return creds
+	}
+	if notify != nil {
+		notify()
+	}
+	_ = d.Reload(ctx)
+	if fresh, err := d.Resolver.Resolve(); err == nil {
+		creds = fresh
+	}
+	return creds
+}
+
 // runWatch runs the polling loop. With Once set it performs a single iteration.
 func runWatch(ctx context.Context, d deps, o runOptions) error {
 	ua := d.Version()
 	f := d.NewFetcher(ua)
 	human := o.isHumanDashboard()
 	var backoff time.Duration
+	var gate reloadGate
 
 	for {
 		if ctx.Err() != nil {
@@ -146,15 +245,20 @@ func runWatch(ctx context.Context, d deps, o runOptions) error {
 			continue
 		}
 
-		u, _, ferr := f.Fetch(ctx, creds.AccessToken)
+		creds = maybeReloadToken(ctx, d, o, &gate, creds, now, func() {
+			fmt.Fprintln(statusW, colorize(o.Color, cDim, "Token expired — running Claude Code once to reload it."))
+		})
+
+		u, creds, ferr := fetchWithRetry(ctx, d, f, creds)
 		if ferr != nil {
-			var apiErr *client.APIError
-			isAPI := errors.As(ferr, &apiErr)
 			switch {
-			case isAPI && apiErr.Status == 401:
-				fmt.Fprintln(statusW, colorize(o.Color, cRed, "Token expired or invalid (HTTP 401)."))
-				fmt.Fprintln(statusW, colorize(o.Color, cDim, "Run any Claude Code command to refresh the token."))
-			case isAPI && apiErr.Status == 429:
+			case isUnauthorized(ferr):
+				printExpiredTokenNotice(statusW, o.Color, 401)
+			case isRateLimited(ferr) && credsExpired(creds, now):
+				// An expired token is rejected with 429, not 401. Surface it as
+				// an auth problem instead of backing off as if rate limited.
+				printExpiredTokenNotice(statusW, o.Color, 429)
+			case isRateLimited(ferr):
 				backoff = client.NextBackoff(backoff, o.Interval, maxBackoff)
 				fmt.Fprintln(statusW, colorize(o.Color, cYellow,
 					fmt.Sprintf("Rate limited (HTTP 429) — backing off to %s.", backoff)))
@@ -192,6 +296,16 @@ func runWatch(ctx context.Context, d deps, o runOptions) error {
 			return nil
 		}
 	}
+}
+
+// printExpiredTokenNotice explains that the stored token has expired and could
+// not be refreshed, plus how to fix it. status is the HTTP status the endpoint
+// used to reject the token: 401, or 429 for a token that was already expired
+// (this endpoint rejects expired tokens with 429 rather than 401).
+func printExpiredTokenNotice(w io.Writer, color bool, status int) {
+	fmt.Fprintln(w, colorize(color, cRed,
+		fmt.Sprintf("Token expired and re-authentication failed (HTTP %d).", status)))
+	fmt.Fprintln(w, colorize(color, cDim, "Run any Claude Code command to refresh the token, then try again."))
 }
 
 // writeFooter prints the status footer for the human dashboard modes. It is a
@@ -267,6 +381,7 @@ func humanLeft(d time.Duration) string {
 func runTUI(ctx context.Context, d deps, o runOptions) error {
 	ua := d.Version()
 	f := d.NewFetcher(ua)
+	var gate reloadGate
 	fetch := func() tui.Result {
 		if mf := d.MockFile(); mf != "" {
 			b, err := d.ReadFile(mf)
@@ -283,8 +398,12 @@ func runTUI(ctx context.Context, d deps, o runOptions) error {
 		if err != nil {
 			return tui.Result{Err: err}
 		}
-		u, _, ferr := f.Fetch(ctx, creds.AccessToken)
+		creds = maybeReloadToken(ctx, d, o, &gate, creds, d.Now(), nil)
+		u, creds, ferr := fetchWithRetry(ctx, d, f, creds)
 		if ferr != nil {
+			if shouldReauth(ferr, creds, d.Now()) {
+				ferr = errors.New("token expired and re-authentication failed — run any Claude Code command to refresh it, then press r to try again")
+			}
 			return tui.Result{Err: ferr}
 		}
 		return tui.Result{Usage: u, Plan: usage.ClassifyPlan(creds.Plan).Label()}
@@ -315,4 +434,38 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 	case <-t.C:
 		return true
 	}
+}
+
+// Auto-reload of an expired token (opt-in via --auto-reload-expired-token). The watch loop
+// asks Claude Code to refresh the stored token instead of merely reporting the
+// expiry, at most once per reloadCooldown.
+const (
+	// reloadCooldown is the minimum delay between auto-refresh attempts.
+	reloadCooldown = 5 * time.Minute
+	// reloadTimeout bounds a single refresh command invocation.
+	reloadTimeout = 30 * time.Second
+	// defaultReloadCmd runs when CCVIEW_RELOAD_CMD is unset: a minimal one-shot
+	// Claude Code call on the cheapest model, which refreshes the OAuth token as
+	// part of its auth bootstrap. Its output is irrelevant and is discarded.
+	defaultReloadCmd = "claude -p --model haiku hi"
+)
+
+// reloadCmdline returns the shell command used to refresh the token: the
+// CCVIEW_RELOAD_CMD override when set, otherwise [defaultReloadCmd].
+func reloadCmdline(getenv func(string) string) string {
+	if c := strings.TrimSpace(getenv("CCVIEW_RELOAD_CMD")); c != "" {
+		return c
+	}
+	return defaultReloadCmd
+}
+
+// runReload executes the refresh command non-interactively with a timeout. The
+// command's stdin/stdout/stderr are left nil (the null device), so it cannot
+// block on a prompt and cannot pollute ccview's display. Only the side effect —
+// Claude Code rewriting the stored token — matters; the token never passes
+// through ccview.
+func runReload(ctx context.Context, getenv func(string) string) error {
+	ctx, cancel := context.WithTimeout(ctx, reloadTimeout)
+	defer cancel()
+	return exec.CommandContext(ctx, "sh", "-c", reloadCmdline(getenv)).Run()
 }
